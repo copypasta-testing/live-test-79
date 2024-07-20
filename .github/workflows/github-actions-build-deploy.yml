@@ -1,0 +1,49 @@
+name: 'Initialize ECR App Runner and deploy'
+on:
+    pull_request:
+        types:
+            - closed
+        branches:
+            - main
+jobs:
+    deploy:
+        runs-on: ubuntu-latest
+        steps:
+            -
+                name: 'Checkout code'
+                uses: actions/checkout@v2
+            -
+                name: 'Set up Docker Buildx'
+                uses: docker/setup-buildx-action@v2
+            -
+                name: 'Configure AWS Credentials'
+                env:
+                    AWS_ACCESS_KEY_ID: '${{ secrets.AWS_OPERA_MICROSERVICE_USER_ACCESS_KEY }}'
+                    AWS_SECRET_ACCESS_KEY: '${{ secrets.AWS_OPERA_MICROSERVICE_USER_SECRET_ACCESS_KEY }}'
+                    AWS_DEFAULT_REGION: us-east-1
+                run: "aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID\naws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY\naws configure set region $AWS_DEFAULT_REGION"
+            -
+                name: 'Assume AWS IAM Role'
+                id: assume-role
+                run: "ROLE_ARN=\"arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ secrets.AWS_ECR_APPRUNNER_ROLE }}\"\nSESSION_NAME=\"${{ github.workflow }}-${{ github.run_id }}-${{ github.actor }}\"\nSESSION_NAME=\"${{ github.run_id }}-${{ github.actor }}\"\necho \"Assuming role with ARN: $ROLE_ARN and session name: $SESSION_NAME\"\nCREDENTIALS=$(aws sts assume-role --role-arn \"$ROLE_ARN\" --role-session-name \"$SESSION_NAME\" --output json)\nif [ $? -ne 0 ]; then\necho \"Failed to assume role\"\nexit 1\nfi\necho \"Successfully assumed role\"\nexport AWS_ACCESS_KEY_ID=$(echo \"$CREDENTIALS\" | jq -r '.Credentials.AccessKeyId')\nexport AWS_SECRET_ACCESS_KEY=$(echo \"$CREDENTIALS\" | jq -r '.Credentials.SecretAccessKey')\nexport AWS_SESSION_TOKEN=$(echo \"$CREDENTIALS\" | jq -r '.Credentials.SessionToken')\necho \"AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID\"\necho \"AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY\"\necho \"AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN\""
+            -
+                name: 'Log in to Amazon ECR'
+                id: login-ecr
+                env:
+                    AWS_DEFAULT_REGION: us-east-1
+                run: 'aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com'
+            -
+                name: 'Check if ECR repository exists'
+                id: ecr-check
+                run: "REPO_NAME=$(basename $GITHUB_REPOSITORY)\naws ecr describe-repositories --repository-names $REPO_NAME || \\\naws ecr create-repository --repository-name $REPO_NAME"
+            -
+                name: 'Build and push Docker image to ECR'
+                run: "REPO_NAME=$(basename $GITHUB_REPOSITORY)\nIMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$REPO_NAME:latest\ndocker build -t $IMAGE_URI .\ndocker push $IMAGE_URI"
+            -
+                name: 'Check if App Runner service exists'
+                id: apprunner-check
+                run: "SERVICE_NAME=$(basename $GITHUB_REPOSITORY)-runner\naws apprunner list-services --query \"ServiceSummaryList[?ServiceName=='$SERVICE_NAME'].ServiceArn\" --output text || echo \"Service does not exist\" > service_check.txt"
+            -
+                name: 'Create App Runner service if it does not exist'
+                if: 'steps.apprunner-check.outputs.service_check == ''Service does not exist'''
+                run: "SERVICE_NAME=$(basename $GITHUB_REPOSITORY)-service\nIMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$(basename $GITHUB_REPOSITORY):latest\naws apprunner create-service --service-name $SERVICE_NAME --source-configuration '{\"ImageRepository\":{\"ImageIdentifier\":\"'$IMAGE_URI'\",\"ImageConfiguration\":{\"Port\":\"8080\"},\"ImageRepositoryType\":\"ECR\"}, \"AutoDeploymentsEnabled\": true}' --health-check-configuration '{\"Protocol\": \"HTTP\", \"Path\": \"/status\"}'"
